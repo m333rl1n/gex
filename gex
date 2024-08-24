@@ -1,0 +1,238 @@
+#! /bin/bash
+GREEN="\033[32m"
+RED="\033[31m"
+RESET="\033[0m"
+SUCCESS="[$GREEN+$RESET]"
+ERROR="[$RED-$RESET]"
+
+function extract_git() {
+	if [ $# -ne 3 ]; then
+		echo -e "Usage: gex extract GIT-DIR DEST-DIR";
+		exit 1;
+	fi
+	GIT_DIR=$2
+	TARGETDIR=$3
+	if [ ! -d "$GIT_DIR/.git" ]; then
+		echo -e "$ERROR There's no .git folder";
+		exit 1;
+	fi
+	mkdir -p "$TARGETDIR"
+
+	function traverse_tree() {
+		local tree=$1
+		local path=$2
+		
+		#Read blobs/tree information from root tree
+		git ls-tree $tree |
+		while read leaf; do
+			type=$(echo $leaf | awk -F' ' '{print $2}') #grep -oP "^\d+\s+\K\w{4}");
+			hash=$(echo $leaf | awk -F' ' '{print $3}') #grep -oP "^\d+\s+\w{4}\s+\K\w{40}");
+			name=$(echo $leaf | awk '{$1=$2=$3=""; print substr($0,4)}') #grep -oP "^\d+\s+\w{4}\s+\w{40}\s+\K.*");
+			
+			# Get the blob data
+			#Ignore invalid git objects (e.g. ones that are missing)
+			if ! git cat-file -e $hash; then
+				continue;
+			fi	
+			
+			if [ "$type" = "blob" ]; then
+				echo -e "$SUCCESS Found file: $path/$name"
+				git cat-file -p $hash > "$path/$name"
+			else
+				echo -e "$SUCCESS Found folder: $path/$name"
+				mkdir -p "$path/$name";
+				#Recursively traverse sub trees
+				traverse_tree $hash "$path/$name";
+			fi
+			
+		done;
+	}
+
+	function traverse_commit() {
+		local base=$1
+		local commit=$2
+		local count=$3
+		
+		#Create folder for commit data
+		echo -e "$SUCCESS Found commit: $GREEN$commit$RESET";
+		path="$base/$count-$commit"
+		mkdir -p $path;
+		#Add meta information
+		git cat-file -p "$commit" > "$path/commit-meta.txt"
+		#Try to extract contents of root tree
+		traverse_tree $commit $path
+	}
+
+	#Current directory as we'll switch into others and need to restore it.
+	OLDDIR=$(pwd)
+	COMMITCOUNT=0;
+
+	#If we don't have an absolute path, add the prepend the CWD
+	if [ "${TARGETDIR:0:1}" != "/" ]; then
+		TARGETDIR="$OLDDIR/$TARGETDIR"
+	fi
+
+	cd $GIT_DIR
+
+	#Extract all object hashes
+	find ".git/objects" -type f | 
+		sed -e "s/\///g" |
+		sed -e "s/\.gitobjects//g" |
+		while read object; do
+		
+		type=$(git cat-file -t $object)
+		
+		# Only analyse commit objects
+		if [ "$type" = "commit" ]; then
+			CURDIR=$(pwd)
+			traverse_commit "$TARGETDIR" $object $COMMITCOUNT
+			cd $CURDIR
+			
+			COMMITCOUNT=$((COMMITCOUNT+1))
+		fi
+		
+		done;
+
+	cd $OLDDIR;
+}
+
+
+function dump_git(){
+    QUEUE=();
+    DOWNLOADED=();
+    BASEURL="$2";
+    BASEDIR="$3";
+    GITDIR=".git"
+    BASEGITDIR="$BASEDIR/$GITDIR/";
+
+
+    if [ $# -lt 3 ]; then
+        echo -e "Usage: gex dump URL DIR ";
+        exit 1;
+    fi
+
+    if [[ ! "$BASEURL" =~ /$GITDIR/$ ]]; then
+        echo -e "$ERROR /$GITDIR/ missing in url";
+        exit 0;
+    fi
+
+    mkdir -p "$BASEGITDIR";
+
+    function start_download() {
+        #Add initial/static git files
+        QUEUE+=('HEAD')
+        QUEUE+=('objects/info/packs')
+        QUEUE+=('description')
+        QUEUE+=('config')
+        QUEUE+=('COMMIT_EDITMSG')
+        QUEUE+=('index')
+        QUEUE+=('packed-refs')
+        QUEUE+=('refs/heads/master')
+        QUEUE+=('refs/remotes/origin/HEAD')
+        QUEUE+=('refs/stash')
+        QUEUE+=('logs/HEAD')
+        QUEUE+=('logs/refs/heads/master')
+        QUEUE+=('logs/refs/remotes/origin/HEAD')
+        QUEUE+=('info/refs')
+        QUEUE+=('info/exclude')
+        QUEUE+=('/refs/wip/index/refs/heads/master')
+        QUEUE+=('/refs/wip/wtree/refs/heads/master')
+
+        #Iterate through QUEUE until there are no more files to download
+        while [ ${#QUEUE[*]} -gt 0 ]
+        do
+            download_item ${QUEUE[@]:0:1}
+            #Remove item from QUEUE
+            QUEUE=( "${QUEUE[@]:1}" )
+        done
+    }
+
+    function download_item() {
+        local objname=$1
+        local url="$BASEURL$objname"
+        local hashes=()
+        local packs=()
+
+        #Check if file has already been downloaded
+        if [[ " ${DOWNLOADED[@]} " =~ " ${objname} " ]]; then
+            return
+        fi
+
+        local target="$BASEGITDIR$objname"
+
+        #Create folder
+        if dir=$(echo "$objname" | grep -oE "^(.*)/"); then
+            mkdir -p "$BASEGITDIR/$dir"
+        fi
+        #Download file
+        curl -L -A $"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/55.0.2883.87 Safari/537.36" -f -k -s "$url" -o "$target"
+        
+        #Mark as downloaded and remove it from the queue
+        DOWNLOADED+=("$objname")
+        if [ ! -f "$target" ]; then
+            echo -e "$ERROR $objname"
+            return
+        fi
+
+        echo -e "$SUCCESS $objname"
+
+        #Check if we have an object hash
+        if [[ "$objname" =~ /[a-f0-9]{2}/[a-f0-9]{38} ]]; then 
+            #Switch into $BASEDIR and save current working directory
+            cwd=$(pwd)
+            cd "$BASEDIR"
+            
+            #Restore hash from $objectname
+            hash=$(echo "$objname" | sed -e 's~objects~~g' | sed -e 's~/~~g')
+            
+            #Check if it's valid git object
+            if ! type=$(git cat-file -t "$hash" 2> /dev/null); then
+                #Delete invalid file
+                cd "$cwd"
+                rm "$target"
+                return 
+            fi
+            
+            #Parse output of git cat-file -p $hash. Use strings for blobs
+            if [[ "$type" != "blob" ]]; then
+                hashes+=($(git cat-file -p "$hash" | grep -oE "([a-f0-9]{40})"))
+            else
+                hashes+=($(git cat-file -p "$hash" | strings -a | grep -oE "([a-f0-9]{40})"))
+            fi
+
+            cd "$cwd"
+        fi 
+        
+        #Parse file for other objects
+        hashes+=($(cat "$target" | strings -a | grep -oE "([a-f0-9]{40})"))
+        for hash in ${hashes[*]}
+        do
+            QUEUE+=("objects/${hash:0:2}/${hash:2}")
+        done
+
+        #Parse file for packs
+        packs+=($(cat "$target" | strings -a | grep -oE "(pack-[a-f0-9]{40})"))
+        for pack in ${packs[*]}
+        do 
+            QUEUE+=("objects/pack/$pack.pack")
+            QUEUE+=("objects/pack/$pack.idx")
+        done
+    }
+
+
+    start_download
+}
+
+# Main script logic
+case "$1" in
+    dump)
+        dump_git "$@"
+        ;;
+    extract)
+        extract_git "$@"
+        ;;
+    *)
+        echo "Usage: gex {dump|extract} [OPTIONS]"
+        exit 1
+        ;;
+esac
